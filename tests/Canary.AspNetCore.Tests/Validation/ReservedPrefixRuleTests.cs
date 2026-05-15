@@ -1,13 +1,29 @@
 ﻿using Canary.AspNetCore.Configuration;
+using Canary.AspNetCore.Context;
 using Canary.AspNetCore.Validation;
 using FluentValidation;
 using FluentValidation.TestHelper;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.DependencyInjection;
 using Shouldly;
 
 namespace Canary.AspNetCore.Tests.Validation;
 
-public sealed class ReservedPrefixRuleTests
+public sealed class ReservedPrefixRuleTests : IDisposable
 {
+    // The validator reads a process-wide IHttpContextAccessor on
+    // ReservedPrefixRuleExtensions. To keep the legacy enforcement tests
+    // isolated, snapshot the accessor on construct and restore on dispose
+    // so the canary-bypass test below doesn't bleed into siblings (or vice
+    // versa if xUnit parallelizes across collections in the future).
+    private readonly IHttpContextAccessor? _originalAccessor =
+        ReservedPrefixRuleExtensions.HttpContextAccessor;
+
+    public void Dispose()
+    {
+        ReservedPrefixRuleExtensions.HttpContextAccessor = _originalAccessor;
+    }
+
     private sealed record StringHolder(string? Value);
 
     private sealed class NullableValidator : AbstractValidator<StringHolder>
@@ -28,6 +44,47 @@ public sealed class ReservedPrefixRuleTests
         }
     }
 
+    /// <summary>
+    /// Stages an HTTP context whose RequestServices return the given
+    /// <see cref="ICanaryRunContext"/>. Mirrors what
+    /// <c>UseCanaryAuth</c> + the per-request DI scope produce in production.
+    /// </summary>
+    private static void StageHttpContextWithCanary(bool isCanary)
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton<ICanaryRunContext>(new StubCanaryRunContext(isCanary));
+        var provider = services.BuildServiceProvider();
+
+        var httpContext = new DefaultHttpContext { RequestServices = provider };
+
+        var accessor = new HttpContextAccessor { HttpContext = httpContext };
+        ReservedPrefixRuleExtensions.HttpContextAccessor = accessor;
+    }
+
+    /// <summary>
+    /// Clears any staged accessor so the validator falls back to the
+    /// legacy enforce-always behavior (the typical state for tests that
+    /// don't exercise the canary path).
+    /// </summary>
+    private static void ClearHttpContext()
+    {
+        ReservedPrefixRuleExtensions.HttpContextAccessor = null;
+    }
+
+    private sealed class StubCanaryRunContext : ICanaryRunContext
+    {
+        public StubCanaryRunContext(bool isCanary)
+        {
+            IsCanary = isCanary;
+            RunId = isCanary ? "abc12345-aaaa-bbbb-cccc-1234567890ab" : null;
+            RunIdShort = isCanary ? "abc12345" : null;
+        }
+
+        public bool IsCanary { get; }
+        public string? RunId { get; }
+        public string? RunIdShort { get; }
+    }
+
     // ---------------------------------------------------------------------------
     // Default pattern: ^e2ec-[0-9a-f]{8}-
     // ---------------------------------------------------------------------------
@@ -39,6 +96,7 @@ public sealed class ReservedPrefixRuleTests
     [InlineData("e2ec-ffffffff-x")]
     public void Validate_MatchingPrefix_FailsWithReservedPrefixCode(string input)
     {
+        ClearHttpContext();
         var validator = new NullableValidator();
         var result = validator.TestValidate(new StringHolder(input));
 
@@ -59,6 +117,7 @@ public sealed class ReservedPrefixRuleTests
     [InlineData("")]
     public void Validate_NonMatching_Passes(string input)
     {
+        ClearHttpContext();
         var validator = new NullableValidator();
         var result = validator.TestValidate(new StringHolder(input));
 
@@ -68,6 +127,7 @@ public sealed class ReservedPrefixRuleTests
     [Fact]
     public void Validate_NullValue_Passes()
     {
+        ClearHttpContext();
         var validator = new NullableValidator();
         var result = validator.TestValidate(new StringHolder(null));
 
@@ -80,6 +140,7 @@ public sealed class ReservedPrefixRuleTests
         // The generic <T, TProperty> overload covers both string and string?
         // properties without separate overloads (NRT is metadata-only so the
         // two would collide at runtime).
+        ClearHttpContext();
         var validator = new NonNullableValidator();
 
         validator.TestValidate(new NonNullableHolder("e2ec-a1b2c3d4-x"))
@@ -99,6 +160,7 @@ public sealed class ReservedPrefixRuleTests
     {
         // Service-specific override - e.g. a future service that uses a
         // different prefix scheme.
+        ClearHttpContext();
         var options = new CanaryOptions { ReservedPrefixPattern = @"^locked-" };
 
         var validator = new InlineValidator<StringHolder>();
@@ -117,5 +179,99 @@ public sealed class ReservedPrefixRuleTests
         // This constant is part of the public contract - frontend agents key
         // off it. Documenting it in a test keeps any rename loud.
         CanaryErrorCodes.ReservedPrefix.ShouldBe("RESERVED_PREFIX");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Canary bypass: when the current request is tagged as canary by
+    // CanaryAuthMiddleware (IsCanary=true on the scoped ICanaryRunContext),
+    // the rule MUST skip so the canary setup itself can create entities
+    // carrying the reserved prefix.
+    // ---------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData("e2ec-a1b2c3d4-Test Tenant")]
+    [InlineData("e2ec-deadbeef-Menu A")]
+    [InlineData("e2ec-00000000-canary-user@example.com")]
+    public void Validate_MatchingPrefix_InCanaryRequest_Bypassed(string input)
+    {
+        // Stage an HTTP context whose RequestServices return IsCanary=true
+        // — i.e. CanaryAuthMiddleware has already accepted the
+        // X-Canary-Run-Id header + superUser JWT on this request.
+        StageHttpContextWithCanary(isCanary: true);
+
+        var validator = new NullableValidator();
+        var result = validator.TestValidate(new StringHolder(input));
+
+        // The whole point of the bypass: the canary infrastructure's own
+        // setup POSTs (e.g. multi-tenant.setup.ts -> POST tenants with name
+        // "e2ec-{runId8}-e2e-TenantA") must NOT 400 with RESERVED_PREFIX.
+        result.ShouldNotHaveValidationErrorFor(x => x.Value);
+    }
+
+    [Theory]
+    [InlineData("e2ec-a1b2c3d4-Test Tenant")]
+    [InlineData("e2ec-deadbeef-Menu A")]
+    public void Validate_MatchingPrefix_NonCanaryRequest_StillFails(string input)
+    {
+        // Same input, but the per-request ICanaryRunContext says IsCanary=false
+        // — i.e. an authenticated real customer who didn't send the canary
+        // header (or sent it without the superUser role and was already 403'd
+        // upstream). The rule must still fire and emit 400 RESERVED_PREFIX.
+        StageHttpContextWithCanary(isCanary: false);
+
+        var validator = new NullableValidator();
+        var result = validator.TestValidate(new StringHolder(input));
+
+        result.ShouldHaveValidationErrorFor(x => x.Value)
+            .WithErrorCode(CanaryErrorCodes.ReservedPrefix);
+    }
+
+    [Fact]
+    public void Validate_HttpContextAccessorNull_FallsBackToEnforceAlways()
+    {
+        // Unit-test scenarios that don't run UseCanaryAuth get a null
+        // accessor — the validator must default to the legacy 1.0.0
+        // behavior (always enforce). Important for the 4 service-side test
+        // projects (IdentityService.Tests, etc.) that already assert the
+        // rule fires.
+        ReservedPrefixRuleExtensions.HttpContextAccessor = null;
+
+        var validator = new NullableValidator();
+        var result = validator.TestValidate(new StringHolder("e2ec-a1b2c3d4-Test"));
+
+        result.ShouldHaveValidationErrorFor(x => x.Value)
+            .WithErrorCode(CanaryErrorCodes.ReservedPrefix);
+    }
+
+    [Fact]
+    public void Validate_AccessorPresentButNoActiveRequest_FallsBackToEnforce()
+    {
+        // Background work / hosted services may resolve a validator without
+        // an active HttpContext (accessor.HttpContext is null). The bypass
+        // must NOT fire — defaulting to enforce keeps the security model
+        // closed by default.
+        ReservedPrefixRuleExtensions.HttpContextAccessor =
+            new HttpContextAccessor(); // HttpContext is null
+
+        var validator = new NullableValidator();
+        var result = validator.TestValidate(new StringHolder("e2ec-a1b2c3d4-Test"));
+
+        result.ShouldHaveValidationErrorFor(x => x.Value)
+            .WithErrorCode(CanaryErrorCodes.ReservedPrefix);
+    }
+
+    [Fact]
+    public void Validate_CanaryBypass_StillAllowsNormalInput()
+    {
+        // Sanity check: in a canary request, non-prefixed input still
+        // passes (the bypass only affects the prefix branch — it doesn't
+        // disable validation altogether).
+        StageHttpContextWithCanary(isCanary: true);
+
+        var validator = new NullableValidator();
+        validator.TestValidate(new StringHolder("MyTenant"))
+            .ShouldNotHaveValidationErrorFor(x => x.Value);
+        validator.TestValidate(new StringHolder(null))
+            .ShouldNotHaveValidationErrorFor(x => x.Value);
     }
 }

@@ -1,4 +1,4 @@
-<Project>
+﻿<Project>
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <LangVersion>latest</LangVersion>
@@ -19,9 +19,9 @@
     <Description>Canary authentication middleware + reserved-prefix validation for E2E canary runs. Recognizes the X-Canary-Run-Id header only when accompanied by a valid superUser JWT (defense-in-depth: the header alone does nothing). Ships a scoped ICanaryRunContext accessor and a FluentValidation MustNotMatchReservedPrefix rule so user-controlled name fields cannot collide with the canary cleanup sweep.</Description>
 
     <!-- Versioning -->
-    <Version>1.0.0</Version>
-    <AssemblyVersion>1.0.0.0</AssemblyVersion>
-    <FileVersion>1.0.0.0</FileVersion>
+    <Version>1.2.0</Version>
+    <AssemblyVersion>1.2.0.0</AssemblyVersion>
+    <FileVersion>1.2.0.0</FileVersion>
 
     <!-- NuGet settings -->
     <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
@@ -44,3 +44,4 @@
     <None Include="$(MSBuildThisFileDirectory)README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 </Project>
+

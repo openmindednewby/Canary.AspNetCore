@@ -49,6 +49,13 @@ public static class CanaryServiceCollectionExtensions
         services.AddScoped<CanaryRunContext>();
         services.AddScoped<ICanaryRunContext>(sp => sp.GetRequiredService<CanaryRunContext>());
 
+        // IHttpContextAccessor is required for the reserved-prefix validator
+        // to look up the per-request ICanaryRunContext and skip the rule for
+        // canary requests. AddHttpContextAccessor is idempotent (it uses
+        // TryAddSingleton internally) so calling it here is safe even if the
+        // consumer has already registered it elsewhere.
+        services.AddHttpContextAccessor();
+
         return services;
     }
 }
