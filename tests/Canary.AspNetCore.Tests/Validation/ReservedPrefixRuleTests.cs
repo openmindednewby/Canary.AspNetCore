@@ -1,4 +1,5 @@
-﻿using Canary.AspNetCore.Configuration;
+﻿using System.Security.Claims;
+using Canary.AspNetCore.Configuration;
 using Canary.AspNetCore.Context;
 using Canary.AspNetCore.Validation;
 using FluentValidation;
@@ -59,6 +60,33 @@ public sealed class ReservedPrefixRuleTests : IDisposable
 
         var accessor = new HttpContextAccessor { HttpContext = httpContext };
         ReservedPrefixRuleExtensions.HttpContextAccessor = accessor;
+    }
+
+    /// <summary>
+    /// Stages an HTTP context with IsCanary=false on the scoped context
+    /// (so bypass A is closed) but an authenticated user whose identity
+    /// name matches the canary prefix — the production shape of bypass B
+    /// (SPA POST from a per-tenant admin whose username carries the e2ec-
+    /// prefix). Pass <paramref name="username"/> = null to leave the user
+    /// anonymous.
+    /// </summary>
+    private static void StageHttpContextWithUser(string? username)
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton<ICanaryRunContext>(new StubCanaryRunContext(isCanary: false));
+        var provider = services.BuildServiceProvider();
+
+        var httpContext = new DefaultHttpContext { RequestServices = provider };
+        if (!string.IsNullOrEmpty(username))
+        {
+            var identity = new ClaimsIdentity(
+                new[] { new Claim(ClaimTypes.Name, username) },
+                authenticationType: "Bearer");
+            httpContext.User = new ClaimsPrincipal(identity);
+        }
+
+        ReservedPrefixRuleExtensions.HttpContextAccessor =
+            new HttpContextAccessor { HttpContext = httpContext };
     }
 
     /// <summary>
@@ -273,5 +301,84 @@ public sealed class ReservedPrefixRuleTests : IDisposable
             .ShouldNotHaveValidationErrorFor(x => x.Value);
         validator.TestValidate(new StringHolder(null))
             .ShouldNotHaveValidationErrorFor(x => x.Value);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Bypass B (1.3.0): the authenticated user's identity name itself
+    // matches the reserved prefix — i.e. the request was made by a canary
+    // test user authenticating with a per-tenant JWT (no superUser role,
+    // no canary header). This is the SPA-driven create flow.
+    // ---------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData("e2ec-849d3d47-e2e-tenanta-admin", "e2ec-849d3d47-Activation-Menu")]
+    [InlineData("e2ec-deadbeef-e2e-tenantb-admin", "e2ec-deadbeef-Pizza Place")]
+    [InlineData("e2ec-00000000-superuser", "e2ec-00000000-Quiz Template")]
+    public void Validate_MatchingPrefix_WithCanaryUser_Bypassed(string username, string input)
+    {
+        // Production shape: SPA logged in as canary tenant admin POSTs to a
+        // create endpoint with a canary-prefixed entity name. CanaryAuthMiddleware
+        // has NOT tagged the request (no superUser role) but the username
+        // itself carries the e2ec- prefix.
+        StageHttpContextWithUser(username);
+
+        var validator = new NullableValidator();
+        var result = validator.TestValidate(new StringHolder(input));
+
+        result.ShouldNotHaveValidationErrorFor(x => x.Value);
+    }
+
+    [Theory]
+    [InlineData("alice@example.com")]      // regular customer username
+    [InlineData("admin-tenanta")]
+    [InlineData("e2ec-foo")]                // doesn't match prefix regex
+    [InlineData("E2EC-a1b2c3d4-Test")]      // uppercase — regex case-sensitive
+    public void Validate_MatchingPrefix_WithRegularUser_StillFails(string username)
+    {
+        // Real customer: even though authenticated, their identity name
+        // doesn't carry the canary prefix → both bypass branches stay
+        // closed → the rule fires for any canary-prefixed input.
+        StageHttpContextWithUser(username);
+
+        var validator = new NullableValidator();
+        var result = validator.TestValidate(new StringHolder("e2ec-a1b2c3d4-Attempt"));
+
+        result.ShouldHaveValidationErrorFor(x => x.Value)
+            .WithErrorCode(CanaryErrorCodes.ReservedPrefix);
+    }
+
+    [Fact]
+    public void Validate_AnonymousRequest_FallsBackToEnforce()
+    {
+        // No authenticated user → bypass B closed. The rule must still fire
+        // on canary-prefixed input — important because the user-creation
+        // path itself uses MustNotMatchReservedPrefix to keep customers from
+        // self-provisioning e2ec- usernames in the first place.
+        StageHttpContextWithUser(username: null);
+
+        var validator = new NullableValidator();
+        var result = validator.TestValidate(new StringHolder("e2ec-a1b2c3d4-Attempt"));
+
+        result.ShouldHaveValidationErrorFor(x => x.Value)
+            .WithErrorCode(CanaryErrorCodes.ReservedPrefix);
+    }
+
+    [Fact]
+    public void Validate_CanaryUser_CustomPatternHonored()
+    {
+        // The username regex used for bypass B is the SAME regex configured
+        // on the rule itself (so a service-specific ReservedPrefixPattern
+        // stays in lockstep on both branches). With a custom pattern that
+        // does NOT match the username, the bypass MUST not fire.
+        StageHttpContextWithUser("e2ec-a1b2c3d4-canary-admin");
+        var options = new CanaryOptions { ReservedPrefixPattern = @"^locked-" };
+
+        var validator = new InlineValidator<StringHolder>();
+        validator.RuleFor(x => x.Value).MustNotMatchReservedPrefix(options);
+
+        // Input matches the custom pattern; username does NOT → enforce.
+        validator.TestValidate(new StringHolder("locked-something"))
+            .ShouldHaveValidationErrorFor(x => x.Value)
+            .WithErrorCode(CanaryErrorCodes.ReservedPrefix);
     }
 }

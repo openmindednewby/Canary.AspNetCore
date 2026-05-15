@@ -27,10 +27,10 @@ namespace Canary.AspNetCore.Validation;
 /// only override the default if you know you need a different rule.
 /// </para>
 /// <para>
-/// <b>Canary bypass:</b> when the current HTTP request has been tagged as
-/// canary by <see cref="Middleware.CanaryAuthMiddleware"/> (i.e.
-/// <see cref="ICanaryRunContext.IsCanary"/> is <see langword="true"/> for
-/// the request), the rule is skipped. This is the whole point of the
+/// <b>Canary bypass — superUser path:</b> when the current HTTP request
+/// has been tagged as canary by <see cref="Middleware.CanaryAuthMiddleware"/>
+/// (i.e. <see cref="ICanaryRunContext.IsCanary"/> is <see langword="true"/>
+/// for the request), the rule is skipped. This is the whole point of the
 /// canary plumbing — canary setup/teardown SHOULD create entities with the
 /// reserved prefix; real customer requests still get the 400. The check
 /// reads <see cref="HttpContextAccessor"/>, which is populated by
@@ -38,6 +38,23 @@ namespace Canary.AspNetCore.Validation;
 /// at pipeline registration. When the accessor is null (unit tests that
 /// don't run the middleware pipeline) the bypass is inert and the rule
 /// behaves as before.
+/// </para>
+/// <para>
+/// <b>Canary bypass — canary-user path (1.3.0):</b> the superUser path
+/// only fires when the caller has BOTH the X-Canary-Run-Id header AND a
+/// superUser JWT. That covers backend-driven canary setup (where the
+/// E2E runner has a superUser bearer token) but it does NOT cover
+/// browser-driven flows where the test signs in as a per-tenant admin and
+/// the SPA POSTs to a create endpoint with a canary-prefixed entity name.
+/// The tenant-admin user has no superUser role, so CanaryAuthMiddleware
+/// would 403 their canary header. To unblock browser-driven create flows
+/// we ALSO bypass when the authenticated user's identity name itself
+/// matches the reserved-prefix regex — canary test users carry e2ec-
+/// usernames by construction, so this is a clean derivative of the same
+/// trust boundary: only canary-created users can create canary-prefixed
+/// entities. A real customer can't impersonate this branch without first
+/// creating a canary-prefixed username, which is exactly what this same
+/// validator rejects on the user-creation path.
 /// </para>
 /// </remarks>
 public static class ReservedPrefixRuleExtensions
@@ -107,14 +124,32 @@ public static class ReservedPrefixRuleExtensions
         return rule
             .Must(value =>
             {
-                // Canary bypass: when the current request has been authenticated
-                // as canary by CanaryAuthMiddleware, the reserved-prefix rule is
-                // exactly what we want to skip — the canary infrastructure
-                // ITSELF needs to create entities with the e2ec- prefix so the
-                // orphan-cleanup sweep can find them later. Real customers
-                // (no canary header / no superUser JWT) never trip this branch
-                // because CanaryAuthMiddleware leaves IsCanary=false for them.
+                // Canary bypass A — superUser path: when the current request
+                // has been authenticated as canary by CanaryAuthMiddleware,
+                // the reserved-prefix rule is exactly what we want to skip —
+                // the canary infrastructure ITSELF needs to create entities
+                // with the e2ec- prefix so the orphan-cleanup sweep can find
+                // them later. Real customers (no canary header / no superUser
+                // JWT) never trip this branch because CanaryAuthMiddleware
+                // leaves IsCanary=false for them.
                 if (IsCurrentRequestCanary())
+                {
+                    return true;
+                }
+
+                // Canary bypass B — canary-user path: browser-driven create
+                // flows authenticate as a per-tenant admin (NOT superUser),
+                // so bypass A misses them. However, canary test users carry
+                // e2ec- usernames by construction (multi-tenant.setup.ts
+                // creates "e2ec-{runId8}-e2e-tenanta-admin" etc.), and only
+                // a canary-tagged request could have created such a user in
+                // the first place. So a logged-in user whose identity name
+                // already matches the reserved prefix is, transitively, a
+                // canary user — allow them to create canary-prefixed child
+                // entities (menus, quizzes, ...). Real customers cannot reach
+                // this branch without first creating a canary-prefixed
+                // username, which this same validator rejects upstream.
+                if (IsAuthenticatedUserCanary(regex))
                 {
                     return true;
                 }
@@ -150,5 +185,45 @@ public static class ReservedPrefixRuleExtensions
 
         var canaryContext = httpContext.RequestServices.GetService<ICanaryRunContext>();
         return canaryContext?.IsCanary == true;
+    }
+
+    /// <summary>
+    /// Tests whether the current request's authenticated user has an
+    /// identity name matching the reserved-prefix regex. Used by bypass B
+    /// (see <see cref="MustNotMatchReservedPrefix{T,TProperty}"/> for the
+    /// trust-boundary rationale).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see cref="System.Security.Claims.ClaimsIdentity.Name"/> reads the
+    /// configured name claim — which for Keycloak/JWT bearer auth is
+    /// <c>preferred_username</c> by default. That matches the username
+    /// stamped on canary test users at setup time. We use the same regex
+    /// the prefix rule itself uses so the two are guaranteed to stay in
+    /// lockstep — a future change to <c>CanaryOptions.ReservedPrefixPattern</c>
+    /// will be honored on both branches without further edits.
+    /// </para>
+    /// <para>
+    /// Returns <see langword="false"/> when there is no accessor wired, no
+    /// active request, no authenticated user, or no name claim — i.e. the
+    /// branch is closed-by-default exactly like bypass A.
+    /// </para>
+    /// </remarks>
+    private static bool IsAuthenticatedUserCanary(Regex regex)
+    {
+        var httpContext = HttpContextAccessor?.HttpContext;
+        if (httpContext is null)
+        {
+            return false;
+        }
+
+        var user = httpContext.User;
+        if (user?.Identity?.IsAuthenticated != true)
+        {
+            return false;
+        }
+
+        var name = user.Identity.Name;
+        return !string.IsNullOrEmpty(name) && regex.IsMatch(name);
     }
 }
