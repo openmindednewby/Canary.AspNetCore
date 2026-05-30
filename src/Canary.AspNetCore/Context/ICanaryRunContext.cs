@@ -16,7 +16,7 @@
 /// <para>
 /// Slice 2-6 services use this for the behavioral mock paths — PaymentService
 /// checks <see cref="IsCanary"/> before calling Stripe; NotificationService
-/// checks it before dispatching SMTP/SMS. IdentityService (slice 1) only
+/// checks it before dispatching SMTP/SMS. TenantService (slice 1) only
 /// uses it indirectly via the Serilog scope + Prometheus label that the
 /// middleware pushes.
 /// </para>

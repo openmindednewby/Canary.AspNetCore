@@ -260,7 +260,7 @@ public sealed class ReservedPrefixRuleTests : IDisposable
         // Unit-test scenarios that don't run UseCanaryAuth get a null
         // accessor — the validator must default to the legacy 1.0.0
         // behavior (always enforce). Important for the 4 service-side test
-        // projects (IdentityService.Tests, etc.) that already assert the
+        // projects (TenantService.Tests, etc.) that already assert the
         // rule fires.
         ReservedPrefixRuleExtensions.HttpContextAccessor = null;
 
