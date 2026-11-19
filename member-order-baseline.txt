@@ -1,0 +1,2 @@
+src/Canary.AspNetCore/Cleanup/CanaryRunId.cs 1
+tests/Canary.AspNetCore.Tests/Validation/ReservedPrefixRuleTests.cs 3
